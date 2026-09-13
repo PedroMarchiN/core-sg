@@ -1,9 +1,3 @@
-# TODO(phase-1-relocation): everything in this file is a faithful, plain-
-# Euclidean kNN-LDP reimplementation that does not use any Core-SG-specific
-# machinery (no mutual reachability, no core distances, no MST). It lives
-# here temporarily as scaffolding toward Phase 2 (the Core-SG-integrated
-# density-aware variant); once Phase 2 exists, this module should move to
-# its own separate repository, since it isn't really "Core-SG" on its own.
 from __future__ import annotations
 
 import heapq
@@ -16,18 +10,27 @@ from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.metrics import pairwise_distances
 from sklearn.utils.validation import check_array, check_is_fitted
 
-try:  # scikit-learn >= 1.6
+try:
     from sklearn.utils.validation import validate_data
-except ImportError:  # pragma: no cover - exercised only on older sklearn
+except ImportError:
     validate_data = None
 
+from .core_sg import CoreSG
 from .knn import knn_from_precomputed
 
 ProgressCallback = Callable[[str, float, dict[str, Any]], None]
 
+NEIGHBOR_SPACES = ("euclidean", "core_sg", "mutual_reachability_exact")
+
 
 def _is_integer(value: Any) -> bool:
     return isinstance(value, (int, np.integer)) and not isinstance(value, bool)
+
+
+def _undirected_keys(u: np.ndarray, v: np.ndarray, n_nodes: int) -> np.ndarray:
+    u = np.asarray(u, dtype=np.int64)
+    v = np.asarray(v, dtype=np.int64)
+    return np.minimum(u, v) * np.int64(n_nodes) + np.maximum(u, v)
 
 
 def _emit_progress(
@@ -39,16 +42,12 @@ def _emit_progress(
     message: str | None = None,
     **info: Any,
 ) -> None:
-    # Duplicated from core_sg.py instead of imported: importing core_sg.core_sg
-    # pulls in the hdbscan_adapter/MST machinery this module deliberately
-    # avoids building for a pure classifier.
     if progress_callback is not None:
         progress_callback(event, elapsed, dict(info))
     if verbose:
         print(message or f"{event} done in {elapsed:.2f}s")
 
 
-# TODO(phase-1-relocation): move to the standalone repo (see module TODO).
 def build_knn_ldp_graph_from_data(
     X: np.ndarray,
     k_max: int,
@@ -57,36 +56,6 @@ def build_knn_ldp_graph_from_data(
     p: int = 2,
     pairwise_dtype=np.float64,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Build the reusable directed k_max-nearest-neighbor structure for kNN-LDP.
-
-    Computes the dense pairwise distance matrix once and extracts, for every
-    point, its `k_max` nearest neighbors (self excluded) via
-    `knn_from_precomputed`. Unlike `build_core_sg_from_data`, this function
-    does not compute core distances and does not build MST/mutual-
-    reachability support: kNN-LDP's propagation only needs neighbor
-    identities, not the density-based structures clustering needs.
-
-    Parameters
-    ----------
-    X : np.ndarray of shape (n_samples, n_features)
-        Input data matrix.
-    k_max : int
-        Maximum neighborhood size to cache; any `k <= k_max` can later be
-        served from the returned arrays without recomputation.
-    metric : str, default="euclidean"
-        Distance metric used to build the pairwise distances.
-    p : int, default=2
-        Power parameter for the Minkowski metric.
-
-    Returns
-    -------
-    idxs_graph : np.ndarray of shape (n_samples, k_max), dtype int64
-        `idxs_graph[i, :k]` are the indices of the k nearest neighbors of
-        `i`, sorted ascending by distance, for any `k <= k_max`.
-    dists_graph : np.ndarray of shape (n_samples, k_max), dtype float64
-        Matching neighbor distances.
-    """
     X = np.asarray(X)
     n = X.shape[0]
 
@@ -109,29 +78,80 @@ def build_knn_ldp_graph_from_data(
     return idxs_graph, dists_graph
 
 
-# TODO(phase-1-relocation): move to the standalone repo (see module TODO).
+def dedupe_core_sg_edges(
+    edges: np.ndarray, n_nodes: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    edges = np.asarray(edges, dtype=np.float64)
+    if edges.ndim != 2 or edges.shape[1] < 3:
+        raise ValueError("edges must have shape (n_edges, 3).")
+
+    u = edges[:, 0].astype(np.int64, copy=False)
+    v = edges[:, 1].astype(np.int64, copy=False)
+    w = edges[:, 2].astype(np.float64, copy=False)
+
+    key = _undirected_keys(u, v, n_nodes)
+    _, first = np.unique(key, return_index=True)
+    return u[first], v[first], w[first]
+
+
+def build_neighbor_graph_from_edges(
+    u: np.ndarray,
+    v: np.ndarray,
+    w: np.ndarray,
+    n_nodes: int,
+    k_max: int,
+    *,
+    mst_keys: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    if k_max <= 0:
+        raise ValueError("k_max must be >= 1.")
+
+    src = np.concatenate([u, v]).astype(np.int64, copy=False)
+    dst = np.concatenate([v, u]).astype(np.int64, copy=False)
+    weight = np.concatenate([w, w]).astype(np.float64, copy=False)
+
+    if mst_keys is None:
+        order = np.lexsort((weight, src))
+    else:
+        key = _undirected_keys(src, dst, n_nodes)
+        pos = np.searchsorted(mst_keys, key)
+        pos_clipped = np.minimum(pos, max(mst_keys.size - 1, 0))
+        is_mst = (mst_keys.size > 0) & (pos < mst_keys.size)
+        is_mst = is_mst & (mst_keys[pos_clipped] == key)
+        group = np.where(is_mst, 0, 1)
+        within = np.where(is_mst, -weight, weight)
+        order = np.lexsort((within, group, src))
+
+    src_sorted = src[order]
+    dst_sorted = dst[order]
+    weight_sorted = weight[order]
+
+    indptr = np.searchsorted(src_sorted, np.arange(n_nodes + 1, dtype=np.int64))
+    degree = np.diff(indptr)
+    if degree.min() < k_max:
+        raise ValueError(
+            f"Point {int(np.argmin(degree))} has degree {int(degree.min())} "
+            f"< k_max={k_max}; the edge set is not a valid Core-SG support."
+        )
+
+    cols = indptr[:n_nodes, None] + np.arange(k_max, dtype=np.int64)[None, :]
+    return dst_sorted[cols], weight_sorted[cols]
+
+
+def mutual_reachability_knn(
+    D: np.ndarray, core_k_list: np.ndarray, min_pts: int, k_max: int
+) -> tuple[np.ndarray, np.ndarray]:
+    D = np.asarray(D, dtype=np.float64)
+    core = np.ascontiguousarray(core_k_list[:, min_pts - 1], dtype=np.float64)
+
+    mreach = np.maximum(D, core[:, None])
+    mreach = np.maximum(mreach, core[None, :])
+    return knn_from_precomputed(mreach, k=k_max, include_self=False)
+
+
 def build_reverse_knn_index(
     idxs_graph: np.ndarray, k: int
 ) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Build the reverse-kNN (RkNN) index for the first `k` columns of `idxs_graph`.
-
-    Parameters
-    ----------
-    idxs_graph : np.ndarray of shape (n_samples, k_max)
-        Cached neighbor indices from `build_knn_ldp_graph_from_data`; only
-        `idxs_graph[:, :k]` is read.
-    k : int
-        Neighborhood size to index, `1 <= k <= idxs_graph.shape[1]`.
-
-    Returns
-    -------
-    indptr : np.ndarray of shape (n_samples + 1,), dtype int64
-    indices : np.ndarray of shape (n_samples * k,), dtype int64
-        CSR-style pair such that `indices[indptr[x]:indptr[x + 1]]` are the
-        points `p` for which `x` is one of `p`'s `k` nearest neighbors
-        (i.e. RkNN(x)).
-    """
     idxs_graph = np.asarray(idxs_graph)
     if idxs_graph.ndim != 2:
         raise ValueError("idxs_graph must be 2D (n_samples, k_max).")
@@ -151,17 +171,7 @@ def build_reverse_knn_index(
     return indptr.astype(np.int64, copy=False), indices.astype(np.int64, copy=False)
 
 
-# TODO(phase-1-relocation): move to the standalone repo (see module TODO).
 class _MaxPriorityQueue:
-    """
-    Max-priority queue over integer node weights.
-
-    `heapq` has no native decrease/increase-key operation, so updates are
-    emulated with the standard lazy-deletion pattern: pushing a fresh entry
-    for a node replaces its record in `_entries`, and any older heap entry
-    for that node is recognized as stale (and skipped) because it no longer
-    matches `_entries[node]`.
-    """
 
     __slots__ = ("_heap", "_entries", "_counter")
 
@@ -194,7 +204,6 @@ class _MaxPriorityQueue:
         return len(self._entries)
 
 
-# TODO(phase-1-relocation): move to the standalone repo (see module TODO).
 def propagate_knn_ldp(
     idxs_graph: np.ndarray,
     y_encoded: np.ndarray,
@@ -202,37 +211,6 @@ def propagate_knn_ldp(
     *,
     k: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Run kNN-LDP's label distribution propagation (Algorithm 1) for a given `k`.
-
-    Every instance's distribution is defined over `n_classes` real classes
-    plus a synthetic "unknown" outcome (the paper's convention), so every
-    row of `label_dist` always sums to 1: an instance starts fully
-    "unknown" and is overwritten with its actual distribution once resolved
-    (either because it was originally labeled, or because propagation
-    reached it).
-
-    Parameters
-    ----------
-    idxs_graph : np.ndarray of shape (n_samples, k_max)
-        Cached neighbor indices from `build_knn_ldp_graph_from_data`; only
-        `idxs_graph[:, :k]` is read.
-    y_encoded : np.ndarray of shape (n_samples,), dtype int
-        Encoded class indices in `[0, n_classes)`, with `-1` for unlabeled.
-    n_classes : int
-        Number of real classes (excludes the synthetic "unknown" outcome).
-    k : int, keyword-only
-        Neighborhood size to use, `1 <= k <= idxs_graph.shape[1]`.
-
-    Returns
-    -------
-    label_dist : np.ndarray of shape (n_samples, n_classes + 1)
-        Final label probability distribution per point; column `n_classes`
-        is the "unknown"/abstention mass.
-    abstained : np.ndarray of shape (n_samples,), dtype bool
-        True for points whose entire mass ended up on "unknown", i.e. no
-        labeled instance was reachable through the directed kNN graph.
-    """
     idxs_graph = np.asarray(idxs_graph)
     if idxs_graph.ndim != 2:
         raise ValueError("idxs_graph must be 2D (n_samples, k_max).")
@@ -293,10 +271,6 @@ def propagate_knn_ldp(
                     if p in pq:
                         pq.push_or_update(p, new_weight)
         else:
-            # Max-heap invariant: weights only ever increase as neighbors
-            # resolve, so once the current maximum weight is 0, every
-            # remaining queued node's weight is also 0 — the whole
-            # remainder abstains at once instead of being popped one by one.
             abstain_idx = np.array(pq.remaining_nodes() + [node], dtype=np.int64)
             label_dist[abstain_idx, :] = 0.0
             label_dist[abstain_idx, unknown_col] = 1.0
@@ -307,17 +281,7 @@ def propagate_knn_ldp(
     return label_dist, abstained
 
 
-# TODO(phase-1-relocation): move to the standalone repo (see module TODO).
 class KNNLDP:
-    """
-    Reusable kNN-LDP propagation engine.
-
-    `fit(X, k_max)` builds the directed k_max-nearest-neighbor structure once
-    (via `build_knn_ldp_graph_from_data`). `propagate(y, k=...)` re-runs
-    Algorithm 1's priority-queue propagation for any `k <= k_max` and any
-    label vector without recomputing pairwise distances or the k_max-NN
-    graph.
-    """
 
     def __init__(
         self,
@@ -325,44 +289,134 @@ class KNNLDP:
         p: int = 2,
         verbose: int = 0,
         progress_callback: ProgressCallback | None = None,
+        neighbor_space: str = "euclidean",
+        min_pts: int | None = None,
+        force_mst_edges: bool = False,
     ) -> None:
+        if neighbor_space not in NEIGHBOR_SPACES:
+            raise ValueError(
+                f"neighbor_space must be one of {NEIGHBOR_SPACES}, got "
+                f"{neighbor_space!r}."
+            )
+
         self.metric = metric
         self.p = p
         self.verbose = verbose
         self.progress_callback = progress_callback
+        self.neighbor_space = neighbor_space
+        self.min_pts = min_pts
+        self.force_mst_edges = force_mst_edges
 
         self.n_samples_ = None
         self.k_max_ = None
+        self.min_pts_ = None
         self.idxs_graph_ = None
         self.dists_graph_ = None
+        self.core_sg_ = None
 
         self.k_ = None
         self.classes_ = None
         self.label_distributions_extended_ = None
         self.abstained_ = None
 
+    def _resolve_min_pts(self, k_max: int) -> int:
+        min_pts = k_max if self.min_pts is None else self.min_pts
+        if not _is_integer(min_pts):
+            raise ValueError("min_pts must be an integer or None.")
+
+        min_pts = int(min_pts)
+        if min_pts < 2:
+            raise ValueError("min_pts must be >= 2 (Core-SG core-distance bound).")
+        if min_pts > k_max:
+            raise ValueError("min_pts must satisfy 2 <= min_pts <= k_max.")
+        return min_pts
+
+    def _graph_from_cached_core_sg(
+        self, k_max: int, min_pts: int
+    ) -> tuple[np.ndarray, np.ndarray]:
+        core_sg = self.core_sg_
+        n = core_sg.n_samples_
+
+        if self.neighbor_space == "mutual_reachability_exact":
+            return mutual_reachability_knn(
+                core_sg.distance_matrix_, core_sg.core_distances_, min_pts, k_max
+            )
+
+        edges = core_sg.get_core_sg_mutual_reachability_distance(min_pts)
+        u, v, w = dedupe_core_sg_edges(edges, n)
+
+        mst_keys = None
+        if self.force_mst_edges:
+            mst = np.asarray(core_sg.extract_mst_from_core_sg(min_pts))
+            mst_keys = np.sort(
+                _undirected_keys(
+                    mst[:, 0].astype(np.int64), mst[:, 1].astype(np.int64), n
+                )
+            )
+
+        return build_neighbor_graph_from_edges(u, v, w, n, k_max, mst_keys=mst_keys)
+
+    def _build_core_sg_backed_graph(
+        self, X: np.ndarray, k_max: int
+    ) -> tuple[np.ndarray, np.ndarray]:
+        min_pts = self._resolve_min_pts(k_max)
+
+        core_sg = CoreSG(verbose=self.verbose)
+        core_sg.fit(X, k_max)
+        self.core_sg_ = core_sg
+        self.min_pts_ = min_pts
+
+        idxs_graph, dists_graph = self._graph_from_cached_core_sg(k_max, min_pts)
+
+        if self.neighbor_space == "core_sg":
+            core_sg.distance_matrix_ = None
+            core_sg._tree_to_labels_data_ = None
+
+        return idxs_graph, dists_graph
+
+    def set_min_pts(self, min_pts: int) -> "KNNLDP":
+        self._ensure_fitted()
+        if self.neighbor_space == "euclidean":
+            raise ValueError(
+                "min_pts does not apply to neighbor_space='euclidean'; "
+                "Euclidean neighbors do not depend on core distances."
+            )
+
+        resolved = int(min_pts)
+        if not _is_integer(min_pts):
+            raise ValueError("min_pts must be an integer.")
+        if resolved < 2:
+            raise ValueError("min_pts must be >= 2 (Core-SG core-distance bound).")
+        if resolved > self.k_max_:
+            raise ValueError("min_pts must satisfy 2 <= min_pts <= k_max.")
+
+        t0 = time()
+        self.idxs_graph_, self.dists_graph_ = self._graph_from_cached_core_sg(
+            self.k_max_, resolved
+        )
+        t1 = time()
+        _emit_progress(
+            "reweight",
+            t1 - t0,
+            verbose=self.verbose,
+            progress_callback=self.progress_callback,
+            message=f"kNN-LDP min_pts = {resolved} reweight done in {t1 - t0:.2f}s",
+            min_pts=resolved,
+        )
+
+        self.min_pts_ = resolved
+        return self
+
     def fit(self, X: np.ndarray, k_max: int) -> "KNNLDP":
-        """
-        Build the reusable k_max-nearest-neighbor structure.
-
-        Parameters
-        ----------
-        X : np.ndarray
-            Input data matrix.
-        k_max : int
-            Maximum neighborhood size used to build the reusable structure.
-
-        Returns
-        -------
-        KNNLDP
-            The fitted instance itself.
-        """
         X = np.asarray(X)
 
         t0 = time()
-        idxs_graph, dists_graph = build_knn_ldp_graph_from_data(
-            X, k_max, metric=self.metric, p=self.p
-        )
+        if self.neighbor_space == "euclidean":
+            idxs_graph, dists_graph = build_knn_ldp_graph_from_data(
+                X, k_max, metric=self.metric, p=self.p
+            )
+        else:
+            idxs_graph, dists_graph = self._build_core_sg_backed_graph(X, k_max)
         t1 = time()
         _emit_progress(
             "build",
@@ -371,6 +425,7 @@ class KNNLDP:
             progress_callback=self.progress_callback,
             message=f"kNN-LDP graph build done in {t1 - t0:.2f}s",
             k_max=k_max,
+            neighbor_space=self.neighbor_space,
         )
 
         self.idxs_graph_ = idxs_graph
@@ -389,22 +444,6 @@ class KNNLDP:
             raise ValueError("k invalid (1 <= k <= k_max).")
 
     def propagate(self, y: np.ndarray, *, k: int) -> "KNNLDP":
-        """
-        Re-run Algorithm 1 for `k` and `y` using the cached kNN structure.
-
-        Parameters
-        ----------
-        y : np.ndarray of shape (n_samples,)
-            Semi-supervised target with `-1` for unlabeled samples.
-        k : int, keyword-only
-            Neighborhood size, `1 <= k <= k_max`.
-
-        Returns
-        -------
-        KNNLDP
-            The instance itself, with `label_distributions_extended_`,
-            `abstained_`, `classes_`, and `k_` updated in place.
-        """
         self._validate_k(k)
 
         y = np.asarray(y)
@@ -442,39 +481,7 @@ class KNNLDP:
         return self
 
 
-# TODO(phase-1-relocation): move to the standalone repo (see module TODO),
-# unless/until Phase 2 grows this same class in place with a Core-SG-backed
-# neighbor space, at which point re-evaluate whether it stays here instead.
 class KNNLDPClassifier(ClassifierMixin, BaseEstimator):
-    """
-    Scikit-learn-style semi-supervised classifier implementing kNN-LDP
-    (Gøttcke, Zimek, Campello, 2025), with the k_max-nearest-neighbor
-    structure built once and reused across repeated calls with different
-    `k`/`y`.
-
-    The internal `KNNLDP` engine is built only once, on the first `fit(...)`
-    call, at the configured `k_max`. Unlike a plain kNN classifier, `y` is
-    not discarded after use: every `fit(...)` call re-runs the label
-    propagation for the given `y` and `k`, while the k_max-nearest-neighbor
-    structure is rebuilt only if it does not exist yet.
-
-    `y` follows the `-1`-for-unlabeled convention used by
-    `sklearn.semi_supervised.LabelPropagation`, so real class labels must be
-    non-negative. Predictions are transductive only in this version:
-    `predict(X)`/`predict_proba(X)` return the cached result for the
-    training set when `X` is `None` or matches the fitted training data in
-    shape; a genuinely new `X` raises `NotImplementedError` (inductive
-    prediction on unseen query points is not implemented yet). This keeps
-    `fit(X, y).predict(X)` always equal to `fit(X, y).transduction_`, unlike
-    `sklearn.semi_supervised.LabelPropagation`, whose `predict(X)` performs
-    true induction and is not guaranteed to match its own `transduction_`.
-
-    Points that cannot be reached from any labeled instance abstain: their
-    predicted label is `-1` (the same sentinel used for unlabeled input) and
-    their `predict_proba` row does not sum to 1, so standard scikit-learn
-    classification metrics score them as errors with no extra handling
-    required, matching the evaluation convention of the original paper.
-    """
 
     def __init__(
         self,
@@ -483,12 +490,18 @@ class KNNLDPClassifier(ClassifierMixin, BaseEstimator):
         p: int = 2,
         verbose: int = 0,
         progress_callback: ProgressCallback | None = None,
+        neighbor_space: str = "euclidean",
+        min_pts: int | None = None,
+        force_mst_edges: bool = False,
     ) -> None:
         self.k_max = k_max
         self.metric = metric
         self.p = p
         self.verbose = verbose
         self.progress_callback = progress_callback
+        self.neighbor_space = neighbor_space
+        self.min_pts = min_pts
+        self.force_mst_edges = force_mst_edges
 
     def _validate_X(self, X: Any) -> np.ndarray:
         check_params = {
@@ -513,6 +526,11 @@ class KNNLDPClassifier(ClassifierMixin, BaseEstimator):
             raise ValueError("k_max must be >= 1.")
         if k_max >= n_samples:
             raise ValueError("k_max must satisfy 1 <= k_max <= n_samples - 1.")
+        if self.neighbor_space != "euclidean" and k_max < 2:
+            raise ValueError(
+                f"k_max must be >= 2 for neighbor_space={self.neighbor_space!r} "
+                "(Core-SG requires it to build core distances)."
+            )
         return k_max
 
     @staticmethod
@@ -548,6 +566,9 @@ class KNNLDPClassifier(ClassifierMixin, BaseEstimator):
             "p": self.p,
             "verbose": self.verbose,
             "progress_callback": self.progress_callback,
+            "neighbor_space": self.neighbor_space,
+            "min_pts": self.min_pts,
+            "force_mst_edges": self.force_mst_edges,
         }
 
     def _has_engine(self) -> bool:
@@ -571,30 +592,14 @@ class KNNLDPClassifier(ClassifierMixin, BaseEstimator):
             self.label_distributions_, self.classes_, self.abstained_
         )
 
-    def fit(self, X: Any, y: Any, *, k: int | None = None) -> "KNNLDPClassifier":
-        """
-        Build the k_max-nearest-neighbor structure once (if needed) and
-        propagate labels for `k`.
-
-        Parameters
-        ----------
-        X : array-like of shape (n_samples, n_features)
-            Dense feature matrix used only when the internal `KNNLDP` engine
-            does not exist yet. After the first fit, subsequent calls reuse
-            the cached structure and do not recompute distances.
-        y : array-like of shape (n_samples,)
-            Semi-supervised target with `-1` for unlabeled samples, following
-            `sklearn.semi_supervised.LabelPropagation`'s convention.
-        k : int or None, keyword-only, default=None
-            Neighborhood size to use for this propagation. If None, `k_max`
-            is used. Always re-validated and re-applied, even when the
-            cached engine is reused.
-
-        Returns
-        -------
-        KNNLDPClassifier
-            The fitted estimator itself.
-        """
+    def fit(
+        self,
+        X: Any,
+        y: Any,
+        *,
+        k: int | None = None,
+        min_pts: int | None = None,
+    ) -> "KNNLDPClassifier":
         if not self._has_engine():
             X_checked = self._validate_X(X)
             k_max = self._validate_k_max(X_checked.shape[0])
@@ -603,18 +608,26 @@ class KNNLDPClassifier(ClassifierMixin, BaseEstimator):
             self.k_max_ = k_max
             self._n_samples_fit_ = X_checked.shape[0]
 
+        if min_pts is not None and min_pts != self.knn_ldp_.min_pts_:
+            self.knn_ldp_.set_min_pts(min_pts)
+
         y_checked = self._validate_y(y, n_samples=self.knn_ldp_.n_samples_)
         k_value = self._validate_k(k, k_max=self.k_max_)
         self.knn_ldp_.propagate(y_checked, k=k_value)
         self.k_ = k_value
+        self.min_pts_ = self.knn_ldp_.min_pts_
         self._sync_current_outputs()
         return self
 
-    def fit_predict(self, X: Any, y: Any, *, k: int | None = None) -> np.ndarray:
-        """
-        Fit the estimator and return `predict(X)` (equal to `transduction_`).
-        """
-        return self.fit(X, y, k=k).predict(X)
+    def fit_predict(
+        self,
+        X: Any,
+        y: Any,
+        *,
+        k: int | None = None,
+        min_pts: int | None = None,
+    ) -> np.ndarray:
+        return self.fit(X, y, k=k, min_pts=min_pts).predict(X)
 
     def _is_training_X(self, X: Any) -> bool:
         X_arr = np.asarray(X)
@@ -631,45 +644,15 @@ class KNNLDPClassifier(ClassifierMixin, BaseEstimator):
             )
 
     def predict_proba(self, X: Any = None) -> np.ndarray:
-        """
-        Return the label probability distribution for the training set.
-
-        Parameters
-        ----------
-        X : None or array-like, default=None
-            If None, or if `X` has the same shape as the data used in
-            `fit(...)`, the cached transductive result is returned with no
-            recomputation. A genuinely new `X` is not supported yet.
-
-        Returns
-        -------
-        np.ndarray of shape (n_samples, n_classes)
-            Raw (non-renormalized) probability mass over `classes_`. Rows
-            sum to less than 1 for partially or fully abstained instances;
-            this is intentional (see class docstring) and matches the
-            original paper's abstention semantics.
-        """
         check_is_fitted(self, attributes=["knn_ldp_"])
         self._check_predict_X(X)
         return self.label_distributions_
 
     def predict(self, X: Any = None) -> np.ndarray:
-        """
-        Return crisp predictions for the training set.
-
-        See `predict_proba` for the supported `X` values. Instances that
-        abstained during propagation (no reachable labeled instance) are
-        predicted as `-1`, reusing the same sentinel used for unlabeled
-        input, so standard `sklearn.metrics` functions score them as errors
-        with no extra handling required.
-        """
         check_is_fitted(self, attributes=["knn_ldp_"])
         self._check_predict_X(X)
         return self.transduction_
 
     def get_fitted_engine(self) -> KNNLDP:
-        """
-        Return the fitted native KNNLDP engine.
-        """
         check_is_fitted(self, attributes=["knn_ldp_"])
         return self.knn_ldp_
